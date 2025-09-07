@@ -1,10 +1,11 @@
 numpy
-torch>=1.7.0
+# CUDA version에 맞는 torch와 torchvision 수동 설치
+# torch>=1.7.0
+# torchvision>=0.10.0
 opencv_python
 loguru
 scikit-image
 tqdm
-torchvision>=0.10.0
 Pillow
 thop
 ninja
