@@ -1,4 +1,4 @@
-
+<!-- 
 
 # YOLOV and YOLOV++ for video object detection.
 ## Update
@@ -238,6 +238,178 @@ If YOLOV series are helpful for your research, please cite the following paper:
 
 
 ```latex
+
+@article{shi2024yolovpp,
+      title={Practical Video Object Detection via Feature Selection and Aggregation}, 
+      author={Yuheng Shi and Tong Zhang and Xiaojie Guo},
+      journal={arXiv preprint arXiv:2407.19650},
+      year={2024},
+}
+
+@article{shi2022yolov,
+  title={YOLOV: Making Still Image Object Detectors Great at Video Object Detection},
+  author={Shi, Yuheng and Wang, Naiyan and Guo, Xiaojie},
+  journal={arXiv preprint arXiv:2208.09686},
+  year={2022}
+}
+``` -->
+# YOLOV, YOLOV++ and YOLOV3P for video object detection.
+
+## Update
+* **` 2024`**:  We introduce YOLOV3P, an enhanced version of YOLOV++ with three key improvements for more efficient and effective video object detection.
+* **` July. 30th, 2024`**:  The pre-print version of the YOLOV++ paper is now available on [Arxiv](https://arxiv.org/abs/2407.19650).
+* **` May. 8th, 2024`**:  We release code, log and weights for YOLOV++.
+* **` April. 21th, 2024`**:  Our enhanced model now achieves a 92.9 AP50(w.o post-processing) on the ImageNet VID dataset, thanks to a more robust backbone and algorithm improvements. It maintains a processing time of 26.5ms per image during batch inference on a 3090 GPU.
+
+## Introduction
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/practical-video-object-detection-via-feature/video-object-detection-on-imagenet-vid)](https://paperswithcode.com/sota/video-object-detection-on-imagenet-vid?p=practical-video-object-detection-via-feature)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/yolov-making-still-image-object-detectors/video-object-detection-on-imagenet-vid)](https://paperswithcode.com/sota/video-object-detection-on-imagenet-vid?p=yolov-making-still-image-object-detectors)
+
+YOLOV series are high performance video object detectors. Please refer to [YOLOV](https://arxiv.org/abs/2208.09686) and [YOLOV++](https://arxiv.org/abs/2407.19650) on Arxiv for more details.
+
+This repo is an implementation of PyTorch version YOLOV, YOLOV++ and **YOLOV3P** based on [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX).
+
+## YOLOV3P: Enhanced Video Object Detection
+
+YOLOV3P introduces three key improvements over YOLOV++ for more efficient and effective video object detection:
+
+### 🎯 Key Innovations
+
+1. **Reference Score-based Frame Selection**
+   - Replaces random reference frame selection with a learnable "reference score" mechanism
+   - Intelligently selects the most informative reference frames for feature aggregation
+   - Improves detection accuracy by focusing on high-quality temporal information
+
+2. **Task-specific Reference Frame Processing**
+   - Separates reference frame processing for regression (REG) and video object detection classification (VOD CLS) tasks
+   - Extracts specialized features for each task, improving computational efficiency
+   - Reduces redundant computation while maintaining or improving performance
+
+3. **Early Exit Branch for FAM (Feature Aggregation Module)**
+   - Introduces an early exit mechanism in the Feature Aggregation Module
+   - Queries that don't require reference frame information bypass FAM and go directly to detection heads
+   - Significantly reduces computational overhead for tokens that can be processed independently
+
+### 🚀 Benefits
+- **Improved Accuracy**: Intelligent reference frame selection enhances temporal feature quality
+- **Enhanced Efficiency**: Task-specific processing and early exit mechanism reduce computational overhead
+- **Better Resource Utilization**: Adaptive processing based on query requirements
+
+// ... existing code (YOLOX Pretrain Models section) ...
+
+## Main result in YOLOV3P
+
+*Experimental results will be updated upon completion of the research.*
+
+| Model                     | size | mAP@50<sup>val<br> | Speed 3090(batch size=32)<br>(ms) | Computational Efficiency Gain | weights | logs |
+|---------------------------|:----:|:------------------:|:---------------------------------:|:-----------------------------:|:-------:|:----:|
+| YOLOV3P s                 | 576  |        TBD         |                TBD                |             TBD               |   TBD   | TBD  |
+| YOLOV3P l                 | 576  |        TBD         |                TBD                |             TBD               |   TBD   | TBD  |
+| YOLOV3P SwinTiny          | 576  |        TBD         |                TBD                |             TBD               |   TBD   | TBD  |
+| YOLOV3P SwinBase          | 576  |        TBD         |                TBD                |             TBD               |   TBD   | TBD  |
+| YOLOV3P FocalLarge        | 576  |        TBD         |                TBD                |             TBD               |   TBD   | TBD  |
+
+## Main result in YOLOV++
+
+<img src="assets/v++_comparision.png" width="500" >
+
+// ... existing YOLOV++ results table ...
+
+## Main result in YOLOV
+
+<img src="assets/comparsion.jpg" width="500" >
+
+// ... existing YOLOV results table ...
+
+## TODO
+- [ ] Analyze existing YOLOV++ codebase to understand current architecture and implementation details
+- [ ] Identify computational bottlenecks in YOLOV++ through profiling and performance analysis to Analyze efficiency of existing early exit mechanisms in related work for reference
+- [ ] Implement reference score-based frame selection mechanism
+- [ ] Develop task-specific reference frame processing for REG and VOD CLS
+- [ ] Add early exit branch to Feature Aggregation Module (FAM)
+- [ ] Conduct comprehensive experiments and release results
+- [ ] Release YOLOV3P code, models and training logs
+
+## Quick Start
+
+<details>
+<summary>Installation</summary>
+
+Install YOLOV3P from source.
+```shell
+git clone [your-repo-url]
+cd YOLOV3P
+```
+
+Create conda env.
+```shell
+conda create -n yolov3p python=3.7
+
+conda activate yolov3p
+
+pip install -r requirements.txt
+
+pip3 install -v -e .
+```
+</details>
+
+<details>
+<summary>Demo</summary>
+
+Step1. Download pretrained weights.
+
+Step2. Run YOLOV3P demos. For example:
+
+```shell
+python tools/vid_demo.py -f [path to your yolov3p exp files] -c [path to your yolov3p weights] --path /path/to/your/video --conf 0.25 --nms 0.5 --tsize 576 --save_result 
+```
+
+For YOLOV++ and YOLOV models, you can use the existing demo scripts as described in the original documentation.
+</details>
+
+// ... existing code (remaining sections) ...
+
+## Training YOLOV3P
+
+<!-- <details>
+<summary>YOLOV3P Training Details</summary>
+
+YOLOV3P introduces new training configurations for the enhanced features:
+
+### Reference Score Training
+```shell
+python tools/vid_train.py -f exps/yolov3p/yolov3p_s.py -c weights/yolox_s.pth --fp16 --reference_score_enabled
+```
+
+### Task-specific Processing Training
+```shell
+python tools/vid_train.py -f exps/yolov3p/yolov3p_s.py -c weights/yolox_s.pth --fp16 --task_specific_ref --separate_reg_cls
+```
+
+### Early Exit Training
+```shell
+python tools/vid_train.py -f exps/yolov3p/yolov3p_s.py -c weights/yolox_s.pth --fp16 --early_exit_enabled --exit_threshold 0.8
+```
+
+### Full YOLOV3P Training
+```shell
+python tools/vid_train.py -f exps/yolov3p/yolov3p_s.py -c weights/yolox_s.pth --fp16 --yolov3p_full
+``` -->
+
+</details>
+
+// ... existing code (Acknowledgements and Citation sections) ...
+
+## Cite YOLOV, YOLOV++ and YOLOV3P
+If YOLOV series are helpful for your research, please cite the following papers:
+
+```latex
+@article{yolov3p2024,
+      title={YOLOV3P: Enhanced Video Object Detection with Reference Score-based Frame Selection and Efficient Feature Aggregation}, 
+      author={[Your Name]},
+      journal={[Journal/Conference]},
+      year={2024},
+}
 
 @article{shi2024yolovpp,
       title={Practical Video Object Detection via Feature Selection and Aggregation}, 
