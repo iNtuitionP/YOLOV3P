@@ -64,8 +64,8 @@ class YOLOVHead(nn.Module):
     
     def __init__(
             self,
-            num_classes,                    # 클래스 수 (ImageNet VID: 30)
-            width=1.0,                      # 네트워크 폭 스케일링 인수
+            num_classes,                   # 클래스 수 (ImageNet VID: 30)
+            width=1.0,                     # 네트워크 폭 스케일링 인수
             strides=[8, 16, 32],           # FPN 각 레벨의 stride
             in_channels=[256, 512, 1024],  # 각 FPN 레벨의 입력 채널 수
             act="silu",                    # 활성화 함수 타입
@@ -94,18 +94,22 @@ class YOLOVHead(nn.Module):
         - sim_thresh: 프레임 간 유사도 임계값. MSA에서 중요한 하이퍼파라미터
         - heads: Multi-head attention의 head 수. 보통 4 사용
         - gmode: Global 모드로 전체 비디오에서 샘플링된 프레임들 활용
-        
-        kwargs 중요 설정들:
         - agg_type: 'msa' (Multi-Scale Attention) 또는 'localagg' (Local Aggregation)
-        - reconf: 재신뢰도 계산 여부
-            -> reconf를 true로 설정하면, MSA를 통해 cls뿐만 아니라 reg의 obj_pred(objectness)도 계산된다.
-            -> # params 는 늘어나지만 성능이 더 좋아지는 효과
-        - decouple_reg: 분류와 회귀를 위한 별도 MSA 사용
-            -> decouple_reg를 true로 설정하면, MSA를 통해 cls와 reg를 별도로 계산한다. 또한 reconf는 자동으로 true로 설정된다.
-            -> 이 방법이 논문에 나오는 방법.
+        - reconf: 재신뢰도 계산 여부. reconf를 true로 설정하면, MSA를 통해 cls뿐만 아니라 reg의 obj_pred(objectness)도 계산된다. 
+                  params 는 늘어나지만 성능이 더 좋아지는 효과
+        - decouple_reg: 분류와 회귀를 위한 별도 MSA 사용. decouple_reg를 true로 설정하면, MSA를 통해 cls와 reg를 별도로 계산한다. 
+                        또한 reconf는 자동으로 true로 설정된다. 이 방법이 논문에 나오는 방법.
         - ota_mode: OTA 라벨 할당 방식 사용 여부
         - vid_cls: 비디오 분류 특징 추출 레이어 사용 여부 (기본 True)
         - vid_reg: 비디오 회귀 특징 추출 레이어 사용 여부 (기본 False)
+        - localBlocks: local aggregation시 transformer 블록 수. 기본적으로 1로 설정하여 online inference시 속도를 높인다.
+
+        참고 설명:
+        - width: 네트워크 폭 스케일링 인수로서 모델의 크기를 조절. 기본 채널 수인 256에 width값을 곱해서 실제 사용할 채널 수를 결정한다.
+        - use_score: 신뢰도 점수 사용 여부. 기본 True. 이게 있으면 attention 계산 시 cls_sccore(분류 신뢰도)와 fg_score(foreground 신뢰도)를 사용한다.
+                     만약 false로 설정하면 신뢰도 점수를 무시하고 순수한 특징 유사도만으로 attention 계산을 한다. 하지만 이는 유사성 문제를 일으킬 수 있다.
+        - default_pre: 이 값은 가장 처음 YOLOX가 가장 처음 detection을 할 때 상위 default_pre개의 proposal을 선택하는 기준이 된다.
+        - pre_nms: 이 값은 가장 처음 YOLOX가 가장 처음 detection을 할 때 pre_nms를 이용해서 중복된 proposal을 제거하는 기준이 된다.
         """
         super().__init__()
 
@@ -189,6 +193,14 @@ class YOLOVHead(nn.Module):
                 if kwargs.get('reconf', False):
                     self.obj_pred = nn.Linear(4 * self.width, 1)        # 1024 -> 1
                 self.cls_convs2 = nn.ModuleList()
+                """
+                추가 설명:
+                - agg_type = localagg로 설정하는 경우 online상황에서 reference window를 사용하여 aggregation하는 방법이다. 
+                - 한편, MSA를 선택하면 reference window를 사용하지 않고 모든 프레임을 사용하여 aggregation하는 방법이다. 
+                - regression box같은 경우는 YOLOX에서 나온 것을 그대로 사용하며, 
+                    classification이나 objectness는 MSA를 통해 나온 feature를 이용하기 때문에 MSA를 선택하는 경우,
+                    cls와 obj를 예측하기 위한 pred를 따로 정의해주는 모습이이다.
+                """
                 
         else:  # OTA 미사용 시
             if kwargs.get('reconf', False):
@@ -215,7 +227,9 @@ class YOLOVHead(nn.Module):
         self.kwargs = kwargs
         Conv = DWConv if depthwise else BaseConv
 
+        # === 각 FPN 레벨마다 분류/회귀 브랜치를 별도로 구성 ===
         for i in range(len(in_channels)):
+            # 각 FPN 레벨마다 stem layer를 추가하여, 특징 차원을 일치시킨다.
             self.stems.append(
                 BaseConv(
                     in_channels=int(in_channels[i] * width),
@@ -225,6 +239,7 @@ class YOLOVHead(nn.Module):
                     act=act,
                 )
             )
+            # cls branch로 3x3 conv를 2개 추가한다.
             self.cls_convs.append(
                 nn.Sequential(
                     *[
@@ -245,6 +260,7 @@ class YOLOVHead(nn.Module):
                     ]
                 )
             )
+            # reg branch로 3x3 conv를 2개 추가한다.
             self.reg_convs.append(
                 nn.Sequential(
                     *[
@@ -265,6 +281,7 @@ class YOLOVHead(nn.Module):
                     ]
                 )
             )
+            # cls pred layer를 추가한다. 이때는 FSM을 위해 1x1 conv를 사용해 실제 object가 있을 법한 위치를 뽑기 위함이다.
             self.cls_preds.append(
                 nn.Conv2d(
                     in_channels=int(256 * width),
@@ -274,15 +291,17 @@ class YOLOVHead(nn.Module):
                     padding=0,
                 )
             )
+            # reg pred layer를 추가한다. 이는 regression box를 예측하기 위한 layer이다.
             self.reg_preds.append(
                 nn.Conv2d(
                     in_channels=int(256 * width),
-                    out_channels=4,
+                    out_channels=4, # (x,y,w,h)
                     kernel_size=1,
                     stride=1,
                     padding=0,
                 )
             )
+            # obj pred layer를 추가한다. 이는 objectness를 예측하기 위한 layer이다.
             self.obj_preds.append(
                 nn.Conv2d(
                     in_channels=int(256 * width),
@@ -292,7 +311,9 @@ class YOLOVHead(nn.Module):
                     padding=0,
                 )
             )
+            # vid_cls, vid_reg가 True인 경우, 비디오 특화 특징 추출 레이어를 추가한다.
             if kwargs.get('vid_cls',True):
+                # VOD cls branch로서 3x3 conv를 2개 추가한다.
                 self.cls_convs2.append(
                     nn.Sequential(
                         *[
@@ -313,6 +334,7 @@ class YOLOVHead(nn.Module):
                         ]
                     )
                 )
+            # VOD reg branch로서 3x3 conv를 2개 추가한다. 기본값은 False이며, 논문에서는 언급되지 않았다.
             if kwargs.get('vid_reg',False):
                 self.reg_convs2.append(
                     nn.Sequential(
@@ -335,13 +357,14 @@ class YOLOVHead(nn.Module):
                     )
                 )
 
+        # === 손실 함수 및 기타 설정 ===
         self.use_l1 = False
-        self.l1_loss = nn.L1Loss(reduction="none")
-        self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none")
-        self.iou_loss = IOUloss(reduction="none")
-        self.strides = strides
-        self.ota_mode = kwargs.get('ota_mode',False)
-        self.grids = [torch.zeros(1)] * len(in_channels)
+        self.l1_loss = nn.L1Loss(reduction="none") # L1 손실 함수
+        self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none") # BCE 손실 함수
+        self.iou_loss = IOUloss(reduction="none") # IoU 손실 함수
+        self.strides = strides # FPN 각 레벨의 stride
+        self.ota_mode = kwargs.get('ota_mode',False) # OTA 라벨 할당 사용 여부
+        self.grids = [torch.zeros(1)] * len(in_channels) # 각 FPN 레벨마다 그리드 좌표를 저장하기 위한 리스트
 
     def initialize_biases(self, prior_prob):
         """
@@ -413,81 +436,95 @@ class YOLOVHead(nn.Module):
                 zip(self.cls_convs, self.reg_convs, self.strides, xin)
         ):
             # 1.1) Stem을 통해 통일된 차원으로 변환
+            # 이때 H와 W는 각 level별 특징맵 그리드의 크기이다.
             x = self.stems[k](x)  # [B, in_channels[k], H, W] -> [B, 256*width, H, W]
             
+            """
+            Implementation Point:
+            - frame들에 대해 reg용 frames들과 VOD cls용 frame들을 나누어서 처리한다.
+            - Batch 차원에 대해 routing하여 frame들을 구분한다.
+
+            suedo code:
+            - reg_frames_idx = frame_routing(x)
+            - reg_x = x[:reg_frames_idx, :, :, :]
+            - vid_cls_x = x[reg_frames_idx:, :, :, :]
+            - reg_feat = reg_conv(reg_x)
+            - vid_feat = self.cls_convs2[k](vid_cls_x)
+            """
+
             # 1.2) 기본 YOLOX 분류/회귀 브랜치를 통한 특징 추출
-            reg_feat = reg_conv(x)  # 회귀 특징 [B, 256, H, W]
-            cls_feat = cls_conv(x)  # 분류 특징 [B, 256, H, W]
+            reg_feat = reg_conv(x)  # 회귀 특징 [B, 256*width, H, W]
+            cls_feat = cls_conv(x)  # 분류 특징 [B, 256*width, H, W]
             
             # 1.3) 비디오 특화 특징 추출 (YOLOV++ 추가 부분)
             if self.kwargs.get('vid_cls', True):
-                vid_feat = self.cls_convs2[k](x)  # 비디오 분류 특징 [B, 256, H, W]
+                vid_feat = self.cls_convs2[k](x)  # 비디오 분류 특징 [B, 256*width, H, W]
             if self.kwargs.get('vid_reg', False):
-                vid_feat_reg = self.reg_convs2[k](x)  # 비디오 회귀 특징 [B, 256, H, W]
+                vid_feat_reg = self.reg_convs2[k](x)  # 비디오 회귀 특징 [B, 256*width, H, W]
 
             # 1.4) 기본 예측 헤드들을 통한 1차 예측 (YOLOX와 동일)
             obj_output = self.obj_preds[k](reg_feat)    # Objectness [B, 1, H, W]
             reg_output = self.reg_preds[k](reg_feat)    # Bounding box [B, 4, H, W]
-            cls_output = self.cls_preds[k](cls_feat)    # Classification [B, classes, H, W]
+            cls_output = self.cls_preds[k](cls_feat)    # Classification [B, num_classes, H, W]
             
             # 1.5) 출력 저장 및 그리드 정보 생성 (훈련/추론에 따라 다름)
             if self.training:
                 # 훈련 시: 원시 출력과 디코딩된 출력 모두 저장
-                output = torch.cat([reg_output, obj_output, cls_output], 1)  # [B, 5+classes, H, W]
+                output = torch.cat([reg_output, obj_output, cls_output], 1)  # [B, 5+num_classes, H, W]
                 output_decode = torch.cat(
-                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
+                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1  # [B, 5+num_classes, H, W]
                 )
                 
                 # 그리드 좌표 생성 및 앵커 위치 계산
                 output, grid = self.get_output_and_grid(
-                    output, k, stride_this_level, xin[0].type()
+                    output, k, stride_this_level, xin[0].type()  # output: [B, H*W, 5+num_classes], grid: [1, H*W, 2]
                 )
-                x_shifts.append(grid[:, :, 0])  # X 좌표
-                y_shifts.append(grid[:, :, 1])  # Y 좌표
+                x_shifts.append(grid[:, :, 0])  # X 좌표 [1, H*W]
+                y_shifts.append(grid[:, :, 1])  # Y 좌표 [1, H*W]
                 expanded_strides.append(
-                    torch.zeros(1, grid.shape[1])
+                    torch.zeros(1, grid.shape[1])  # [1, H*W]
                     .fill_(stride_this_level)
                     .type_as(xin[0])
                 )
                 
                 # L1 손실을 위한 원본 예측 저장
                 if self.use_l1:
-                    batch_size = reg_output.shape[0]
-                    hsize, wsize = reg_output.shape[-2:]
-                    reg_output = reg_output.view(
+                    batch_size = reg_output.shape[0] # [B, 4, H, W] -> B
+                    hsize, wsize = reg_output.shape[-2:] # [B, 4, H, W] -> H, W
+                    reg_output = reg_output.view( # [B, 4, H, W] -> [B, n_anchors, 4, H, W]
                         batch_size, self.n_anchors, 4, hsize, wsize
                     )
-                    reg_output = reg_output.permute(0, 1, 3, 4, 2).reshape(
+                    reg_output = reg_output.permute(0, 1, 3, 4, 2).reshape( # [B, n_anchors, 4, H, W] -> [B, H*W, 4]
                         batch_size, -1, 4
                     )
-                    origin_preds.append(reg_output.clone())
-                outputs.append(output)
+                    origin_preds.append(reg_output.clone())  # [B, H*W, 4]
+                outputs.append(output)  # [B, H*W, 5+num_classes]
             else:
                 # 추론 시: 디코딩된 출력만 필요
-                output_decode = torch.cat(
-                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
+                output_decode = torch.cat( 
+                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1  # [B, 5+num_classes, H, W]
                 )
             
             # 1.6) 시간적 특징 집합을 위한 특징 저장
             # 비디오 특화 특징이 있으면 우선 사용, 없으면 기본 특징 사용
             if self.kwargs.get('vid_cls', True):
-                raw_cls_features.append(vid_feat)  # 비디오 분류 특징 사용
+                raw_cls_features.append(vid_feat)  # 비디오 분류 특징 사용 [B, 256*width, H, W]
             else:
-                raw_cls_features.append(cls_feat)  # 기본 분류 특징 사용
+                raw_cls_features.append(cls_feat) # 기본 분류 특징 사용 [B, 256*width, H, W]
             if self.kwargs.get('vid_reg', False):
-                raw_reg_features.append(vid_feat_reg)  # 비디오 회귀 특징 사용
+                raw_reg_features.append(vid_feat_reg) # 비디오 회귀 특징 사용 [B, 256*width, H, W]
             else:
-                raw_reg_features.append(reg_feat)     # 기본 회귀 특징 사용
+                raw_reg_features.append(reg_feat) # 기본 회귀 특징 사용 [B, 256*width, H, W]
 
-            outputs_decode.append(output_decode)
+            outputs_decode.append(output_decode)  # [B, 5+num_classes, H, W]
         # === STEP 2: 기본 후처리 및 Proposal 선별 ===
         
         # 2.1) 다중 스케일 출력을 하나로 합치고 디코딩
-        self.hw = [x.shape[-2:] for x in outputs_decode]  # 각 레벨의 H, W 저장
+        self.hw = [x.shape[-2:] for x in outputs_decode]  # 각 레벨의 H, W 저장 [(H1,W1), (H2,W2), (H3,W3)]
         outputs_decode = torch.cat([x.flatten(start_dim=2) for x in outputs_decode], dim=2
-                                   ).permute(0, 2, 1)  # [B, total_anchors, 5+classes]
-        decode_res = self.decode_outputs(outputs_decode, dtype=xin[0].type())  # 앵커 좌표 디코딩
-        preds_per_frame = []  # 각 프레임별 proposal 수 저장용
+                                   ).permute(0, 2, 1)  # [B, total_anchors, 5+num_classes]
+        decode_res = self.decode_outputs(outputs_decode, dtype=xin[0].type())  # 앵커 좌표 디코딩 [B, total_anchors, 5+num_classes]
+        preds_per_frame = []  # 각 프레임별 proposal 수 저장용 List[int]
 
         # 2.2) 훈련 시 라벨 할당 (OTA Dynamic K Matching)
         if self.training:
@@ -502,6 +539,13 @@ class YOLOVHead(nn.Module):
                 )
             ota_idxs, cls_targets, reg_targets,\
                 obj_targets, fg_masks, num_fg, num_gts, l1_targets = assigned_packs
+            # ota_idxs: List[Tensor] - 각 프레임별 선별된 인덱스들
+            # cls_targets: [total_fg] - 분류 타겟
+            # reg_targets: [total_fg, 4] - 회귀 타겟
+            # obj_targets: [total_fg] - Objectness 타겟
+            # fg_masks: [B, total_anchors] - Foreground 마스크
+            # num_fg, num_gts: int - FG 수, GT 수
+            # l1_targets: [total_fg, 4] - L1 손실 타겟
 
             if not self.ota_mode: ota_idxs = None  # OTA 미사용 시 None
         else:
@@ -509,36 +553,40 @@ class YOLOVHead(nn.Module):
 
         # 2.3) 특징을 평면화하여 후속 처리 준비
         cls_feat_flatten = torch.cat(
-            [x.flatten(start_dim=2) for x in raw_cls_features], dim=2
-        ).permute(0, 2, 1)  # [batch, total_features, channels]
+            [x.flatten(start_dim=2) for x in raw_cls_features], dim=2  # 각각 [B, 256*width, H*W]
+        ).permute(0, 2, 1)  # [B, total_anchors, 256*width]
         reg_feat_flatten = torch.cat(
-            [x.flatten(start_dim=2) for x in raw_reg_features], dim=2
-        ).permute(0, 2, 1)   # [batch, total_features, channels]
+            [x.flatten(start_dim=2) for x in raw_reg_features], dim=2   # 각각 [B, 256*width, H*W]
+        ).permute(0, 2, 1)   # [B, total_anchors, 256*width]
 
         # 2.4) 1차 후처리로 고품질 proposal 선별 (YOLOV++의 핵심)
         # 이 단계에서 대부분의 낮은 품질 detection들이 걸러짐
         pred_result, agg_idx, refine_obj_masks, cls_label_reorder = self.postprocess_widx(
-            decode_res,
+            decode_res,              # [B, total_anchors, 5+num_classes]
             num_classes=self.num_classes,
             nms_thre=self.nms_thresh,     # Pre-NMS 임계값 (0.75)
-            ota_idxs=ota_idxs,            # OTA에서 선별된 인덱스들
+            ota_idxs=ota_idxs,            # List[Tensor] - OTA에서 선별된 인덱스들
         )
+        # pred_result: List[Tensor] - 각 프레임별 선별된 detection [N_selected, 7+num_classes]
+        # agg_idx: List[Tensor] - 각 프레임별 선별된 인덱스들 [N_selected]
+        # refine_obj_masks: List[Tensor] - Objectness 마스크
+        # cls_label_reorder: List[Tensor] - 재정렬된 클래스 라벨
 
         # 2.5) 각 프레임별 선별된 proposal 수 계산
-        for p in agg_idx:
+        for p in agg_idx:  # agg_idx: List[Tensor or None]
             if p is None: 
                 preds_per_frame.append(0)
             else: 
-                preds_per_frame.append(p.shape[0])  # 각 프레임의 proposal 수
+                preds_per_frame.append(p.shape[0])  # 각 프레임의 proposal 수 int
 
         # 2.6) 예외 처리: proposal이 없는 경우
         if sum(preds_per_frame) == 0 and self.training:
             # 훈련 시 proposal이 없으면 0 손실 반환
-            return torch.tensor(0), 0, 0, 0, 0, 1, 0, 0, 0
+            return torch.tensor(0), 0, 0, 0, 0, 1, 0, 0, 0  # 9개 손실 값
 
         if not self.training and imgs.shape[0] == 1:
             # 추론 시 단일 프레임이면 1차 결과만 반환
-            return pred_result, pred_result
+            return pred_result, pred_result  # List[Tensor], List[Tensor]
 
         # === STEP 3: 시간적 특징 집합 준비 ===
         
@@ -612,7 +660,41 @@ class YOLOVHead(nn.Module):
             # 전역적 프레임 간 유사도를 계산하여 적응적 특징 융합
             kwargs = self.kwargs
             kwargs.update({'lframe': lframe, 'gframe': gframe, 'afternum': self.Afternum})
-            
+
+            """
+            implementation point:
+            - router를 달아서 바로 head로 갈 수 있도록 token-wise early exit branch를 생성한다.
+
+            suedo code:
+            - not_early_exit_idx, early_exit_idx = router(features_cls_raw, features_reg_raw)
+            - features_cls, features_reg = self.agg(
+                features_cls_raw[not_early_exit_idx],
+                features_reg_raw[not_early_exit_idx],
+                cls_scores[not_early_exit_idx],
+                fg_scores[not_early_exit_idx],
+                sim_thresh=self.sim_thresh,
+                ave=self.ave,
+                use_mask=self.use_mask,
+                **kwargs
+            )
+
+            if self.kwargs.get('decouple_reg', False):
+                _, features_reg = self.agg_iou(
+                    features_cls_raw[not_early_exit_idx], 
+                    features_reg_raw[not_early_exit_idx], 
+                    cls_scores[not_early_exit_idx], 
+                    fg_scores[not_early_exit_idx],
+                    sim_thresh=self.sim_thresh,
+                    ave=self.ave, use_mask=self.use_mask, **kwargs
+                )
+            else:
+                features_reg = None
+
+            - cls_preds = self.cls_pred(features_cls)  # [N, num_classes]
+            - obj_preds = self.obj_pred(torch.cat([obj_preds[not_early_exit_idx], obj_preds[early_exit_idx]], dim=0))  # [N, 1]
+            - reg_preds = self.reg_pred(torch.cat([reg_preds[not_early_exit_idx], reg_preds[early_exit_idx]], dim=0))  # [N, 4]
+            """
+
             # MSA를 통한 시간적 특징 집합 (핵심!)
             features_cls, features_reg = self.agg(
                 features_cls_raw,        # [1, N, 256] 분류 특징
@@ -800,8 +882,8 @@ class YOLOVHead(nn.Module):
         grid = self.grids[k]  # 캐시된 그리드 가져오기
 
         batch_size = output.shape[0]
-        n_ch = 5 + self.num_classes  # [x, y, w, h, obj, cls1, cls2, ...]
-        hsize, wsize = output.shape[-2:]  # 특징맵 크기
+        n_ch = 5 + self.num_classes  # [x, y, w, h, obj, cls1, cls2, ...] 총 5+classes 채널
+        hsize, wsize = output.shape[-2:]  # 특징맵 크기, height, width
         
         # 그리드 크기가 변경되었으면 새로 생성
         if grid.shape[2:4] != output.shape[2:4]:
