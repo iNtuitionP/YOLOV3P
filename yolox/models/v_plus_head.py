@@ -517,12 +517,12 @@ class YOLOVHead(nn.Module):
                 raw_reg_features.append(reg_feat) # 기본 회귀 특징 사용 [B, 256*width, H, W]
 
             outputs_decode.append(output_decode)  # [B, 5+num_classes, H, W]
-        # === STEP 2: 기본 후처리 및 Proposal 선별 ===
         
+        # === STEP 2: 기본 후처리 및 Proposal 선별 ===
         # 2.1) 다중 스케일 출력을 하나로 합치고 디코딩
         self.hw = [x.shape[-2:] for x in outputs_decode]  # 각 레벨의 H, W 저장 [(H1,W1), (H2,W2), (H3,W3)]
         outputs_decode = torch.cat([x.flatten(start_dim=2) for x in outputs_decode], dim=2
-                                   ).permute(0, 2, 1)  # [B, total_anchors, 5+num_classes]
+                                   ).permute(0, 2, 1)  # [B, total_anchors = H1*W1 + H2*W2 + H3*W3, 5+num_classes]
         decode_res = self.decode_outputs(outputs_decode, dtype=xin[0].type())  # 앵커 좌표 디코딩 [B, total_anchors, 5+num_classes]
         preds_per_frame = []  # 각 프레임별 proposal 수 저장용 List[int]
 
@@ -543,7 +543,7 @@ class YOLOVHead(nn.Module):
             # cls_targets: [total_fg] - 분류 타겟
             # reg_targets: [total_fg, 4] - 회귀 타겟
             # obj_targets: [total_fg] - Objectness 타겟
-            # fg_masks: [B, total_anchors] - Foreground 마스크
+            # fg_masks: [B, total_anchors] - Foreground 마스크, foreground 앵커들의 인덱스들만 True로 설정된 마스크
             # num_fg, num_gts: int - FG 수, GT 수
             # l1_targets: [total_fg, 4] - L1 손실 타겟
 
@@ -559,7 +559,7 @@ class YOLOVHead(nn.Module):
             [x.flatten(start_dim=2) for x in raw_reg_features], dim=2   # 각각 [B, 256*width, H*W]
         ).permute(0, 2, 1)   # [B, total_anchors, 256*width]
 
-        # 2.4) 1차 후처리로 고품질 proposal 선별 (YOLOV++의 핵심)
+        # 2.4) 1차 후처리로 고품질 proposal 선별
         # 이 단계에서 대부분의 낮은 품질 detection들이 걸러짐
         pred_result, agg_idx, refine_obj_masks, cls_label_reorder = self.postprocess_widx(
             decode_res,              # [B, total_anchors, 5+num_classes]
@@ -632,7 +632,6 @@ class YOLOVHead(nn.Module):
         }
 
         # === STEP 4: 특징 집합 방식 선택 (YOLOV++의 핵심 혁신!) ===
-        
         if self.kwargs.get('agg_type', 'localagg') == 'localagg':
             # 4.1) Local Aggregation 방식
             # 지역적 시간 정보를 활용한 특징 집합
@@ -690,9 +689,9 @@ class YOLOVHead(nn.Module):
             else:
                 features_reg = None
 
-            - cls_preds = self.cls_pred(features_cls)  # [N, num_classes]
-            - obj_preds = self.obj_pred(torch.cat([obj_preds[not_early_exit_idx], obj_preds[early_exit_idx]], dim=0))  # [N, 1]
-            - reg_preds = self.reg_pred(torch.cat([reg_preds[not_early_exit_idx], reg_preds[early_exit_idx]], dim=0))  # [N, 4]
+            - cls_preds = self.cls_pred(torch.cat([features_cls, features_cls_raw[early_exit_idx]], dim=0))  # [N, num_classes]
+            - obj_preds = self.obj_pred(torch.cat([features_reg, features_reg_raw[early_exit_idx]], dim=0))  # [N, 1]
+            - reg_preds = self.reg_pred(torch.cat([features_reg, features_reg_raw[early_exit_idx]], dim=0))  # [N, 4]
             """
 
             # MSA를 통한 시간적 특징 집합 (핵심!)
@@ -726,137 +725,202 @@ class YOLOVHead(nn.Module):
 
         # === STEP 5: 손실 계산 (훈련 시) ===
         if self.training:
-            outputs = torch.cat(outputs, 1)  # 모든 FPN 레벨의 출력 결합
+            # === STEP 5-1: 기본 출력 준비 ===
+            outputs = torch.cat(outputs, 1)  # 모든 FPN 레벨의 출력 결합 [batch, total_anchors, 5+classes]
+            
+            # === STEP 5-2: Refined 타겟 생성 방식 선택 ===
             if not self.ota_mode:
+                # === 5-2A: 비-OTA 모드 - IoU 기반 라벨 할당 ===
+                # 전통적인 IoU 기반 방식으로 refined 타겟 생성
                 stime = time.time()
-                (refine_cls_targets,
-                 refine_cls_masks,
-                 refine_obj_targets,
-                 refine_obj_masks) = (
+                (refine_cls_targets,   # IoU 가중 분류 타겟들
+                 refine_cls_masks,     # 분류 감독 마스크들 (애매한 IoU 제외)
+                 refine_obj_targets,   # Objectness 타겟들
+                 refine_obj_masks) = ( # Objectness 감독 마스크들
                     self.get_iou_based_label(pred_result,agg_idx,labels,outputs,reg_targets,cls_targets)
                 )
+                # 배치별 결과를 하나로 합치기
                 refine_cls_targets = torch.cat(refine_cls_targets, 0)
                 refine_cls_masks = torch.cat(refine_cls_masks, 0)
                 refine_obj_targets = torch.cat(refine_obj_targets, 0)
                 refine_obj_masks = torch.cat(refine_obj_masks, 0)
             else:
+                # === 5-2B: OTA 모드 - 다양한 refined 타겟 생성 방식 ===
+                # 기본적으로는 refined 타겟 없음 (OTA가 충분히 정확하므로)
                 refine_cls_targets, refine_cls_masks, refine_obj_targets = None, None, None
                 
-                # 정적 객체 탐지기 감독 사용 (비디오 OTA 미사용 시)
+                # === 5-2B-1: 정적 객체 탐지기 감독 사용 ===
+                # 비디오 OTA를 사용하지 않을 때의 대안적 방식들
                 if not self.kwargs.get('vid_ota',False):
-                    # OTA 인덱스를 후보에 연결하지 않음
+                    
+                    # === Case 1: CLS_OTA 모드 (기본값: True) ===
                     if self.kwargs.get('cls_ota',True):
+                        # === Subcase 1-1: OTA FG와 분리 처리 ===
                         if not self.kwargs.get('cat_ota_fg',True):
+                            # OTA foreground와 새로운 proposal을 분리하여 처리
                             refine_cls_targets = []
                             for i in range(len(ota_idxs)):
-                                tmp_reorder = cls_label_reorder[i]
+                                tmp_reorder = cls_label_reorder[i]  # 클래스 재정렬 정보
+                                # 유효한 OTA 인덱스와 재정렬 정보가 있는 경우
                                 if ota_idxs[i] != None and tmp_reorder!=None and len(tmp_reorder):
+                                    # 재정렬된 순서로 분류 타겟 추출
                                     tmp_cls_targets = cls_targets[i][torch.stack(tmp_reorder)]
                                     refine_cls_targets.append(tmp_cls_targets)
+                            
+                            # 추출된 타겟들이 있으면 합치기, 없으면 빈 텐서 생성
                             if len(refine_cls_targets):
                                 refine_cls_targets = torch.cat(refine_cls_targets, 0)
                             else:
                                 refine_cls_targets = torch.cat(cls_targets, 0).new_zeros(0, self.num_classes)
+                        
+                        # === Subcase 1-2: OTA FG와 통합 처리 (기본값) ===
+                        # 대부분의 경우 여기서 끝남 (refined 타겟 없이 OTA만 사용)
                     else:
+                        # === Case 2: 비-CLS_OTA 모드 - IoU 기반 보조 사용 ===
                         (refine_cls_targets,
-                         refine_cls_masks,
-                         _,
+                         refine_cls_masks,     # IoU 기반 분류 마스크 생성
+                         _,                    # refine_obj_targets는 사용 안함
                          iou_base_obj_masks) = (
                             self.get_iou_based_label(pred_result, agg_idx, labels, outputs, reg_targets, cls_targets)
                         )
                         refine_cls_targets = torch.cat(refine_cls_targets, 0)
                         refine_cls_masks = torch.cat(refine_cls_masks, 0)
-                else:#re-assign lable for vid detections
-                    vid_preds = outputs.clone().detach()
-                    bidx_accum = 0
+                else:
+                    # === 5-2B-2: 비디오 OTA 모드 - 고급 라벨 재할당 ===
+                    # 시간적 집합 후 예측을 기반으로 라벨을 다시 할당하는 혁신적 방법
+                    
+                    # === Step 1: 비디오 예측 텐서 구성 ===
+                    vid_preds = outputs.clone().detach()  # 기본 예측 복사
+                    bidx_accum = 0  # 배치 누적 인덱스
+                    
+                    # 각 배치의 선별된 proposal들에 refined 예측값 할당
                     for b_idx,f_idx in enumerate(agg_idx):
-                        if f_idx is None: continue
-                        tmp_pred = vid_preds[b_idx,f_idx]
+                        if f_idx is None: continue  # 해당 배치에 선별된 proposal이 없으면 건너뛰기
                         
-                        # 기본 탐지기의 다른 예측들 제거 (매우 낮은 값으로 설정)
-                        vid_preds[b_idx, :] = -1e3
-                        tmp_pred[:,-self.num_classes:] = cls_preds[bidx_accum:bidx_accum+preds_per_frame[b_idx]]
-                        tmp_pred[:,4:5] = obj_preds[bidx_accum:bidx_accum+preds_per_frame[b_idx]]
-                        vid_preds[b_idx,f_idx] = tmp_pred
-                        bidx_accum += preds_per_frame[b_idx]
+                        tmp_pred = vid_preds[b_idx,f_idx]  # 선별된 proposal들의 예측값
+                        
+                        # 기본 탐지기의 다른 예측들 억제 (매우 낮은 값으로 설정)
+                        vid_preds[b_idx, :] = -1e3  # 선별되지 않은 앵커들은 무시
+                        
+                        # 시간적 집합으로 개선된 예측값들로 교체
+                        tmp_pred[:,-self.num_classes:] = cls_preds[bidx_accum:bidx_accum+preds_per_frame[b_idx]]  # refined 분류
+                        tmp_pred[:,4:5] = obj_preds[bidx_accum:bidx_accum+preds_per_frame[b_idx]]              # refined objectness
+                        vid_preds[b_idx,f_idx] = tmp_pred  # 업데이트된 예측값 저장
+                        
+                        bidx_accum += preds_per_frame[b_idx]  # 다음 배치를 위한 인덱스 누적
 
+                    # === Step 2: 비디오 예측 기반 OTA 라벨 할당 ===
+                    # 개선된 예측을 사용하여 새로운 OTA 할당 수행
                     vid_packs = self.get_fg_idx(imgs,
                                                  x_shifts,
                                                  y_shifts,
                                                  expanded_strides,
                                                  labels,
-                                                 vid_preds,
+                                                 vid_preds,      # 개선된 예측 사용
                                                  origin_preds,
                                                  dtype=xin[0].dtype,
                                                  )
+                    # OTA 결과 언패킹
                     vid_fg_idxs, vid_cls_targets, vid_reg_targets, \
                         vid_obj_targets, vid_fg_masks, vid_num_fg, \
                         vid_num_gts, vid_l1_targets = vid_packs
+                    
+                    # === Step 3: 비디오 OTA 결과를 refined 타겟으로 변환 ===
                     refine_obj_masks,refine_cls_targets = [],[]
+                    
                     for b_idx,f_idx in enumerate(agg_idx):
                         if f_idx is None: continue
-                        f_idx = f_idx.cuda()
+                        f_idx = f_idx.cuda()  # GPU로 이동
+                        
+                        # 해당 배치의 선별된 proposal들 중 foreground 마스크 추출
                         refine_obj_masks.append(vid_fg_masks[b_idx][f_idx])
+                        
+                        # foreground proposal들의 분류 타겟 추출
                         tmp_cls_targets = []
                         for feature_idx in f_idx[vid_fg_masks[b_idx][f_idx]]:
+                            # 비디오 OTA에서 매칭된 분류 타겟 찾기
                             cls_tar_idx = torch.where(feature_idx==vid_fg_idxs[b_idx])[0]
                             tmp_cls_targets.append(vid_cls_targets[b_idx][cls_tar_idx])
+                        
+                        # 분류 타겟들이 있으면 결합
                         if len(tmp_cls_targets):
                             tmp_cls_targets = torch.cat(tmp_cls_targets,0)
                             refine_cls_targets.append(tmp_cls_targets)
-                    refine_obj_masks = torch.cat(refine_obj_masks,0)
+                    
+                    # === Step 4: 최종 타겟 텐서 구성 ===
+                    refine_obj_masks = torch.cat(refine_obj_masks,0)  # 객체 마스크 결합
                     if len(refine_cls_targets):
-                        refine_cls_targets = torch.cat(refine_cls_targets, 0)
+                        refine_cls_targets = torch.cat(refine_cls_targets, 0)  # 분류 타겟 결합
                     else:
+                        # 분류 타겟이 없으면 빈 텐서 생성
                         refine_cls_targets = torch.cat(cls_targets, 0).new_zeros(0, self.num_classes)
 
-
-            cls_targets = torch.cat(cls_targets, 0)
-            reg_targets = torch.cat(reg_targets, 0)
-            obj_targets = torch.cat(obj_targets, 0)
-            fg_masks = torch.cat(fg_masks, 0)
+            # === STEP 5-3: 기본 YOLOX 타겟들 결합 ===
+            # 배치별로 나누어져 있던 기본 타겟들을 하나로 합치기
+            cls_targets = torch.cat(cls_targets, 0)    # [total_fg, num_classes] - 분류 타겟
+            reg_targets = torch.cat(reg_targets, 0)    # [total_fg, 4] - 회귀 타겟
+            obj_targets = torch.cat(obj_targets, 0)    # [total_anchors, 1] - objectness 타겟
+            fg_masks = torch.cat(fg_masks, 0)          # [total_anchors] - foreground 마스크
             if self.use_l1:
-                l1_targets = torch.cat(l1_targets, 0)
+                l1_targets = torch.cat(l1_targets, 0)  # [total_fg, 4] - L1 손실 타겟
 
+            # === STEP 5-4: 손실 계산 함수 호출 ===
+            # 기본 YOLOX 손실 + YOLOV++ refined 손실들을 모두 계산
             return self.get_losses(
-                outputs,
-                cls_targets,
-                reg_targets,
-                obj_targets,
-                fg_masks,
-                num_fg,
-                num_gts,
-                l1_targets,
-                origin_preds,
-                cls_preds,
-                obj_preds,
-                reg_preds,
-                refine_obj_masks,
-                refine_cls_targets,
-                refine_cls_masks,
-                refine_obj_targets,
+                outputs,              # 기본 YOLOX 예측들
+                cls_targets,          # 기본 분류 타겟
+                reg_targets,          # 기본 회귀 타겟
+                obj_targets,          # 기본 objectness 타겟
+                fg_masks,             # foreground 마스크
+                num_fg,               # 총 foreground 수
+                num_gts,              # 총 GT 수
+                l1_targets,           # L1 손실 타겟
+                origin_preds,         # L1 손실용 원본 예측
+                cls_preds,            # refined 분류 예측
+                obj_preds,            # refined objectness 예측
+                reg_preds,            # refined 회귀 예측
+                refine_obj_masks,     # refined objectness 마스크
+                refine_cls_targets,   # refined 분류 타겟
+                refine_cls_masks,     # refined 분류 마스크
+                refine_obj_targets,   # refined objectness 타겟
             )
         else:
-            # 추론 시 후처리 단계
-            # 개선된 예측들을 프레임별로 분할 (preds_per_frame에 따라)
+            # === STEP 6: 추론 시 최종 후처리 ===
+            # 시간적 집합으로 개선된 예측들을 최종 탐지 결과로 변환
+            
+            # === STEP 6-1: 프레임별 예측 분할 ===
+            # MSA로 집합된 예측들을 다시 각 프레임별로 분할
             cls_per_frame, obj_per_frame, reg_per_frame = [], [], []
+            
             for i in range(len(preds_per_frame)):
+                # === Refined Objectness 처리 ===
                 if self.kwargs.get('reconf',False):
+                    # 재신뢰도 계산이 활성화된 경우 refined objectness 사용
                     obj_per_frame.append(obj_preds[:preds_per_frame[i]].squeeze(-1))
-                    obj_preds = obj_preds[preds_per_frame[i]:]
+                    obj_preds = obj_preds[preds_per_frame[i]:]  # 다음 프레임을 위해 슬라이싱
+                
+                # === Refined Classification 처리 ===
+                # 시간적 집합으로 개선된 분류 예측 분할
                 cls_per_frame.append(cls_preds[:preds_per_frame[i]])
-                cls_preds = cls_preds[preds_per_frame[i]:]
+                cls_preds = cls_preds[preds_per_frame[i]:]  # 다음 프레임을 위해 슬라이싱
 
-            # reconf가 비활성화된 경우 기존 objectness 사용
+            # === STEP 6-2: Objectness 소스 결정 ===
+            # reconf가 비활성화된 경우 기본 objectness 사용
             if not self.kwargs.get('reconf',False): 
-                obj_per_frame = None
-            result, result_ori = postprocess(copy.deepcopy(pred_result),
-                                             self.num_classes,
-                                             cls_per_frame,
-                                             conf_output = obj_per_frame,
-                                             nms_thre = nms_thresh,
+                obj_per_frame = None  # 기본 YOLOX objectness 사용
+
+            # === STEP 6-3: 최종 후처리 수행 ===
+            # NMS, 신뢰도 필터링 등의 표준 후처리 과정
+            result, result_ori = postprocess(copy.deepcopy(pred_result),  # 기본 예측 결과 (백업용)
+                                             self.num_classes,            # 클래스 수
+                                             cls_per_frame,               # 프레임별 refined 분류 예측
+                                             conf_output = obj_per_frame, # 프레임별 refined objectness (선택적)
+                                             nms_thre = nms_thresh,       # NMS 임계값
                                              )
-            return result, result_ori  # result
+            # === STEP 6-4: 결과 반환 ===
+            # result: NMS 등 후처리가 완료된 최종 탐지 결과
+            # result_ori: 후처리 전 원본 결과 (디버깅/분석용)
+            return result, result_ori
 
     def get_output_and_grid(self, output, k, stride, dtype):
         """
@@ -1546,8 +1610,7 @@ class YOLOVHead(nn.Module):
     def postprocess_widx(self, prediction, num_classes, nms_thre=0.5, ota_idxs=None,conf_thresh=0.001):
         """
         YOLOV++의 핵심: 시간적 집합을 위한 고품질 Proposal 선별 함수
-        
-        이 함수는 YOLOV++의 가장 중요한 혁신 중 하나입니다.
+
         기본 YOLOX 예측에서 고품질 proposal들만 선별하여 시간적 특징 집합의 입력으로 사용합니다.
         
         Args:
@@ -1577,143 +1640,170 @@ class YOLOVHead(nn.Module):
         - 속도 향상: 불필요한 계산 제거
         - 성능 향상: 노이즈가 적은 고품질 특징으로 집합 수행
         """
-        # find topK predictions, play the same role as RPN
-        '''
+        # === STEP 1: RPN 역할의 TopK 예측 선별 ===
+        # 전체 앵커 중에서 고품질 proposal들만 선별 (Region Proposal Network 역할)
+        
+        # === STEP 2: 좌표 형식 변환 (Center → Corner) ===
+        # YOLOX 출력은 (center_x, center_y, width, height) 형태
+        # NMS와 후처리를 위해 (x1, y1, x2, y2) corner 형태로 변환
+        box_corner = prediction.new(prediction.shape)  # 동일한 크기의 새 텐서 생성
+        box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2  # x1 = center_x - width/2
+        box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2  # y1 = center_y - height/2
+        box_corner[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2  # x2 = center_x + width/2
+        box_corner[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2  # y2 = center_y + height/2
+        prediction[:, :, :4] = box_corner[:, :, :4]  # 원본에 corner 좌표 덮어쓰기
 
-        Args:
-            prediction: [batch,feature_num,5+clsnum]
-            num_classes:
-            conf_thre:
-            conf_thre_high:
-            nms_thre:
+        # === STEP 3: 결과 저장용 변수 초기화 ===
+        output = [None for _ in range(len(prediction))]           # 각 이미지별 선별된 예측들
+        output_index = [None for _ in range(len(prediction))]     # 각 이미지별 선별된 앵커 인덱스들
+        reorder_cls = [None for _ in range(len(prediction))]      # OTA 매칭용 클래스 재정렬 정보
+        refined_obj_masks = []                                    # Refined 손실 계산용 객체 마스크들
 
-        Returns:
-            [batch,topK,5+clsnum]
-        '''
-        box_corner = prediction.new(prediction.shape)
-        box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
-        box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
-        box_corner[:, :, 2] = prediction[:, :, 0] + prediction[:, :, 2] / 2
-        box_corner[:, :, 3] = prediction[:, :, 1] + prediction[:, :, 3] / 2
-        prediction[:, :, :4] = box_corner[:, :, :4]
-
-        output = [None for _ in range(len(prediction))]
-        output_index = [None for _ in range(len(prediction))]
-        reorder_cls = [None for _ in range(len(prediction))]
-        refined_obj_masks = []
+        # === STEP 4: 배치별 Proposal 선별 수행 ===
         for i, image_pred in enumerate(prediction):
-            # 훈련 모드에서는 OTA 인덱스를 출력으로 사용
-            obj_mask = torch.zeros(0,1)
+            # 현재 이미지의 refined objectness 마스크 초기화
+            obj_mask = torch.zeros(0,1)  # [0, 1] - 시작은 빈 마스크
 
+            # 빈 예측인 경우 건너뛰기
             if not image_pred.size(0):
                 continue
-            # Get score and class with highest confidence
+                
+            # === STEP 4-1: 클래스 신뢰도 계산 및 Detection 구성 ===
+            # 가장 높은 클래스 신뢰도와 해당 클래스 추출
             class_conf, class_pred = torch.max(image_pred[:, 5: 5 + num_classes], 1, keepdim=True)
-            # Detections ordered as (x1, y1, x2, y2, obj_conf, class_conf, class_pred)
+            
+            # Detection 형태로 재구성: [x1, y1, x2, y2, obj_conf, cls_conf, cls_pred, all_cls_scores]
             detections = torch.cat(
                 (image_pred[:, :5], class_conf, class_pred.float(), image_pred[:, 5: 5 + num_classes]), 1)
+            
+            # === STEP 4-2: OTA Foreground 인덱스 처리 (훈련시) ===
             if ota_idxs is not None:
                 if len(ota_idxs[i]) > 0 and self.kwargs.get('cat_ota_fg',True):
-                    ota_idx = ota_idxs[i]
-                    output[i] = detections[ota_idx, :]
-                    output_index[i] = ota_idx.cpu()
-                    tmp_ota_mask = torch.ones_like(output_index[i]).unsqueeze(1)
-                    obj_mask = torch.cat((obj_mask, tmp_ota_mask))
+                    # OTA에서 선별된 foreground 앵커들을 우선적으로 포함
+                    ota_idx = ota_idxs[i]  # 현재 이미지의 OTA foreground 인덱스들
+                    output[i] = detections[ota_idx, :]  # OTA 인덱스에 해당하는 detection들
+                    output_index[i] = ota_idx.cpu()     # CPU로 이동하여 저장
+                    tmp_ota_mask = torch.ones_like(output_index[i]).unsqueeze(1)  # OTA는 모두 foreground
+                    obj_mask = torch.cat((obj_mask, tmp_ota_mask))  # 객체 마스크에 추가
 
+            # === STEP 4-3: 신뢰도 기반 필터링 ===
+            # Combined confidence: objectness * class_confidence >= threshold
             conf_mask = (detections[:, 4] * detections[:, 5] >= conf_thresh).squeeze()
-            minimal_limit = self.kwargs.get('minimal_limit',0)
-            maximal_limit = self.kwargs.get('maximal_limit',0)
-            if minimal_limit !=0:
-                # 최소 detection 수 제한 추가
+            
+            # === STEP 4-4: Detection 수 제한 처리 ===
+            minimal_limit = self.kwargs.get('minimal_limit',0)  # 최소 detection 수 제한
+            maximal_limit = self.kwargs.get('maximal_limit',0)  # 최대 detection 수 제한
+            
+            # 최소 제한: 신뢰도가 낮아도 최소 개수는 보장
+            if minimal_limit != 0:
                 if conf_mask.sum() < minimal_limit:
-                    # 상위 minimal_limit개의 detection 선택
+                    # 신뢰도 순으로 상위 minimal_limit개 강제 선택
                     _, top_idx = torch.topk(detections[:, 4] * detections[:, 5], minimal_limit)
                     conf_mask[top_idx] = True
-            if maximal_limit !=0:
-                # add a maximum limitation to the number of detections
+            
+            # 최대 제한: 너무 많은 detection 방지 (메모리 효율성)
+            if maximal_limit != 0:
                 if conf_mask.sum() > maximal_limit:
                     logger.warning('current obj above conf thresh: %d' % conf_mask.sum())
                     
-                    # 해결책 1: 상위 점수의 detection들만 선택
+                    # 상위 점수 기반 선별: 가장 신뢰도 높은 maximal_limit개만 선택
                     _, top_idx = torch.topk(detections[:, 4] * detections[:, 5], maximal_limit)
-                    conf_mask = torch.zeros_like(conf_mask)
-                    conf_mask[top_idx] = True
+                    conf_mask = torch.zeros_like(conf_mask)  # 기존 마스크 초기화
+                    conf_mask[top_idx] = True  # 상위 인덱스들만 True로 설정
 
-                    # 해결책 2는 테스트용으로만 사용 (현재 비활성화)
-                    # NMS 기반 접근법: 너무 많은 detection이 있을 때 NMS로 먼저 줄인 후 선택
-                    # 하지만 현재는 단순히 상위 점수 기반 선택 방식(해결책 1)을 사용
+                    # 참고: NMS 기반 제한 방식도 고려했지만 현재는 단순 점수 기반 방식 사용
+                    # 이유: 계산 효율성과 명확한 제어 가능
 
-            conf_idx = torch.where(conf_mask)[0]
-            # 디버깅용 로깅 (필요시 활성화 가능): 신뢰도 임계값 이상의 객체 수
-            detections = detections[conf_mask]
+            # === STEP 4-5: 신뢰도 필터링 적용 ===
+            conf_idx = torch.where(conf_mask)[0]  # 신뢰도 조건을 만족하는 앵커 인덱스들
+            detections = detections[conf_mask]    # 조건을 만족하는 detection들만 선별
+            
+            # 선별된 detection이 없으면 다음 이미지로
             if not detections.size(0):
                 refined_obj_masks.append(obj_mask)
                 continue
 
+            # === STEP 4-6: Pre-NMS 적용 (선택적) ===
             if self.kwargs.get('use_pre_nms',True):
+                # 중복 제거를 위한 NMS 적용
                 nms_out_index = torchvision.ops.batched_nms(
-                    detections[:, :4],
-                    detections[:, 4] * detections[:, 5],
-                    detections[:, 6],
-                    nms_thre,
+                    detections[:, :4],                    # bbox 좌표
+                    detections[:, 4] * detections[:, 5],  # combined confidence
+                    detections[:, 6],                     # 클래스 라벨
+                    nms_thre,                             # NMS 임계값
                 )
             else:
+                # NMS 사용하지 않으면 모든 detection 유지
                 nms_out_index = torch.arange(detections.shape[0])
 
-            # OTA 인덱스에 이미 있는 인덱스들 처리
-            if ota_idxs!= None and ota_idxs[i] is not None and len(ota_idxs[i]) > 0:  # OTA 모드
-                if not self.kwargs.get('use_pre_nms',True) :
+            # === STEP 4-7: OTA 인덱스와의 통합 처리 ===
+            if ota_idxs!= None and ota_idxs[i] is not None and len(ota_idxs[i]) > 0:  # 훈련 모드
+                if not self.kwargs.get('use_pre_nms',True):
                     if not self.kwargs.get('cat_ota_fg',True):
-
-                        # not cat ota_idxs, set these ota idx to fg while others to bg
+                        # OTA 인덱스와 일치하는 것만 foreground로 마킹
                         obj_mask = torch.zeros_like(nms_out_index).unsqueeze(1)
-                        tmp_reorder = []
+                        tmp_reorder = []  # OTA 매칭을 위한 재정렬 정보
+                        
                         for j in nms_out_index:
+                            # 현재 인덱스가 OTA foreground에 포함되는지 확인
                             tmp_idx = torch.where(ota_idxs[i]==conf_idx[j])[0]
                             if len(tmp_idx):
-                                obj_mask[j] = 1
-                                tmp_reorder.append(tmp_idx[0])
-                        # 디버깅용 출력 (비활성화됨): 총 인덱스, OTA 인덱스, 전체 OTA 인덱스 수
-                        reorder_cls[i] = tmp_reorder
-                        abs_idx = conf_idx[nms_out_index].cpu()
+                                obj_mask[j] = 1  # foreground로 마킹
+                                tmp_reorder.append(tmp_idx[0])  # 재정렬 정보 저장
+                                
+                        reorder_cls[i] = tmp_reorder  # 클래스 재정렬 정보 저장
+                        abs_idx = conf_idx[nms_out_index].cpu()  # 절대 인덱스
                     else:
-                        # OTA 인덱스와 배경으로 설정된 다른 인덱스들 연결
+                        # OTA 인덱스와 새로운 detection들을 분리하여 처리
+                        # OTA에 없는 새로운 detection들은 background로 처리
                         abs_idx_out_ota = torch.tensor([conf_idx[j] for j in nms_out_index if conf_idx[j] not in ota_idxs[i]])
                         abs_idx = abs_idx_out_ota
-                        bg_mask = torch.zeros_like(abs_idx_out_ota).cpu()
+                        bg_mask = torch.zeros_like(abs_idx_out_ota).cpu()  # 새로운 것들은 background
                         obj_mask = torch.cat((obj_mask.type_as(bg_mask), bg_mask.unsqueeze(1)))
                 else:
-                    abs_idx = None
+                    abs_idx = None  # Pre-NMS 사용시에는 별도 인덱스 불필요
             else:
+                # 추론 모드: 모든 detection을 background로 처리
+                # 이렇게 함으로써 추론 모드에서는 refined_obj로 인한 손실을 계산하지 않아도 된다.
                 abs_idx_out_ota = conf_idx[nms_out_index]
                 abs_idx = abs_idx_out_ota.cpu()
-                bg_mask = torch.zeros_like(abs_idx_out_ota).cpu()
+                bg_mask = torch.zeros_like(abs_idx_out_ota).cpu()  # 모두 background
                 obj_mask = torch.cat((obj_mask.type_as(bg_mask), bg_mask.unsqueeze(1)))
 
+            # === STEP 4-8: NMS 결과 적용 ===
+            detections = detections[nms_out_index]  # NMS 통과한 detection들만 유지
 
-            detections = detections[nms_out_index]
-
+            # === STEP 4-9: 결과 통합 ===
+            # 현재 이미지의 detection들을 전체 출력에 추가
             if output[i] is None:
-                output[i] = detections
+                output[i] = detections  # 첫 번째 detection들
             else:
-                output[i] = torch.cat((output[i], detections))
+                output[i] = torch.cat((output[i], detections))  # 기존 OTA detection과 합침
 
+            # 인덱스 정보도 동일하게 통합
             if output_index[i] is None:
                 if self.kwargs.get('use_pre_nms',True):
-                    output_index[i] = conf_idx[nms_out_index]
+                    output_index[i] = conf_idx[nms_out_index]  # NMS 후 인덱스
                 else:
-                    output_index[i] = abs_idx
+                    output_index[i] = abs_idx  # 절대 인덱스
             else:
                 if abs_idx.shape[0] != 0:
-                    output_index[i] = torch.cat((output_index[i], abs_idx))
+                    output_index[i] = torch.cat((output_index[i], abs_idx))  # 기존과 합침
 
+            # 현재 이미지의 객체 마스크 저장
             refined_obj_masks.append(obj_mask)
 
+        # === STEP 5: 전체 배치 결과 통합 ===
         if len(refined_obj_masks) > 0:
-            refined_obj_masks = torch.cat(refined_obj_masks, 0)
+            refined_obj_masks = torch.cat(refined_obj_masks, 0)  # 모든 이미지의 마스크 합침
         else:
-            refined_obj_masks = torch.zeros(0,1)
+            refined_obj_masks = torch.zeros(0,1)  # 빈 마스크
 
+        # === STEP 6: 최종 결과 반환 ===
+        # output: 각 이미지별 선별된 고품질 proposal들
+        # output_index: proposal들의 원본 앵커 인덱스들  
+        # refined_obj_masks: refined 손실 계산용 fg/bg 마스크
+        # reorder_cls: OTA 매칭을 위한 클래스 재정렬 정보
         return output, output_index, refined_obj_masks, reorder_cls
 
     def get_idx_predictions(self,prediction,idxs,num_classes):
@@ -1793,59 +1883,76 @@ class YOLOVHead(nn.Module):
         4. 분류는 IoU 가중 one-hot, 회귀는 GT 좌표 사용
         5. 모든 배치의 결과를 리스트로 수집
         """
-        bbox_preds = outputs[:, :, :4]  # [batch, n_anchors_all, 4]
-        obj_preds = outputs[:, :, 4].unsqueeze(-1)  # [batch, n_anchors_all, 1]
-        cls_preds = outputs[:, :, 5:]  # [batch, n_anchors_all, n_cls]
+        # === STEP 1: 예측 출력 분리 및 전처리 ===
+        # 모델 출력에서 각 예측 성분을 분리
+        bbox_preds = outputs[:, :, :4]  # [batch, total_anchors, 4] - bbox 회귀 예측 (x,y,w,h)
+        obj_preds = outputs[:, :, 4].unsqueeze(-1)  # [batch, total_anchors, 1] - objectness 예측
+        cls_preds = outputs[:, :, 5:]  # [batch, total_anchors, num_classes] - 클래스 분류 예측
 
-        # calculate targets
+        # === STEP 2: Ground Truth 라벨 처리 ===
+        # Mixup 데이터 증강이 적용되었는지 확인 (라벨 차원이 5보다 크면 mixup)
         mixup = labels.shape[2] > 5
         if mixup:
-            label_cut = labels[..., :5]
+            label_cut = labels[..., :5]  # mixup일 경우 앞의 5개 차원만 사용 (cls,x,y,w,h)
         else:
-            label_cut = labels
-        nlabel = (label_cut.sum(dim=2) > 0).sum(dim=1)  # number of objects
+            label_cut = labels  # 일반적인 경우 전체 라벨 사용
+        
+        # 각 배치별 실제 GT 객체 수 계산 (패딩된 0 라벨 제외)
+        nlabel = (label_cut.sum(dim=2) > 0).sum(dim=1)  # [batch] - 각 이미지의 GT 객체 수
 
-        total_num_anchors = outputs.shape[1]
-        x_shifts = torch.cat(x_shifts, 1)  # [1, n_anchors_all]
-        y_shifts = torch.cat(y_shifts, 1)  # [1, n_anchors_all]
-        expanded_strides = torch.cat(expanded_strides, 1)
+        # === STEP 3: 앵커 관련 정보 통합 ===
+        total_num_anchors = outputs.shape[1]  # 모든 FPN 레벨의 총 앵커 수
+        # 각 FPN 레벨별로 나누어져 있던 그리드 정보들을 하나로 합침
+        x_shifts = torch.cat(x_shifts, 1)  # [1, total_anchors] - 모든 앵커의 X 그리드 좌표
+        y_shifts = torch.cat(y_shifts, 1)  # [1, total_anchors] - 모든 앵커의 Y 그리드 좌표
+        expanded_strides = torch.cat(expanded_strides, 1)  # [1, total_anchors] - 각 앵커의 stride 값
+        
+        # L1 손실 사용시 원본 예측값들도 통합
         if self.use_l1:
-            origin_preds = torch.cat(origin_preds, 1)
+            origin_preds = torch.cat(origin_preds, 1)  # [batch, total_anchors, 4]
 
-        fg_ids = []
-        cls_targets = []
-        reg_targets = []
-        l1_targets = []
-        obj_targets = []
-        fg_masks = []
+        # === STEP 4: 결과 저장용 리스트 초기화 ===
+        fg_ids = []          # 각 배치별 foreground 앵커 인덱스들
+        cls_targets = []     # 각 배치별 분류 타겟들 (IoU 가중 one-hot)
+        reg_targets = []     # 각 배치별 회귀 타겟들 (GT bbox 좌표)
+        l1_targets = []      # 각 배치별 L1 손실용 타겟들
+        obj_targets = []     # 각 배치별 objectness 타겟들 (binary mask)
+        fg_masks = []        # 각 배치별 foreground 마스크들
 
-        num_fg = 0.0
-        num_gts = 0.0
+        num_fg = 0.0         # 전체 배치의 총 foreground 앵커 수
+        num_gts = 0.0        # 전체 배치의 총 GT 객체 수
 
+        # === STEP 5: 배치별 OTA 라벨 할당 수행 ===
         for batch_idx in range(outputs.shape[0]):
-            num_gt = int(nlabel[batch_idx])
+            num_gt = int(nlabel[batch_idx])  # 현재 이미지의 GT 객체 수
             num_gts += num_gt
+            
+            # GT 객체가 없는 경우: 모든 앵커를 background로 설정
             if num_gt == 0:
-                fg_idx = []#torch.where(fg_mask)[0]
-                cls_target = outputs.new_zeros((0, self.num_classes))
-                reg_target = outputs.new_zeros((0, 4))
-                l1_target = outputs.new_zeros((0, 4))
-                obj_target = outputs.new_zeros((total_num_anchors, 1))
-                fg_mask = outputs.new_zeros(total_num_anchors).bool()
+                fg_idx = []  # foreground 앵커 없음
+                cls_target = outputs.new_zeros((0, self.num_classes))  # 빈 분류 타겟
+                reg_target = outputs.new_zeros((0, 4))  # 빈 회귀 타겟
+                l1_target = outputs.new_zeros((0, 4))   # 빈 L1 타겟
+                obj_target = outputs.new_zeros((total_num_anchors, 1))  # 모든 앵커가 background
+                fg_mask = outputs.new_zeros(total_num_anchors).bool()   # 모든 앵커가 background
 
+            # GT 객체가 있는 경우: OTA 알고리즘으로 최적 매칭 수행
             else:
-                gt_bboxes_per_image = labels[batch_idx, :num_gt, 1:5]
-                gt_classes = labels[batch_idx, :num_gt, 0]  # [batch,120,class+xywh]
-                bboxes_preds_per_image = bbox_preds[batch_idx]
+                # 현재 이미지의 GT 정보 추출
+                gt_bboxes_per_image = labels[batch_idx, :num_gt, 1:5]  # [num_gt, 4] - GT bbox 좌표
+                gt_classes = labels[batch_idx, :num_gt, 0]  # [num_gt] - GT 클래스 라벨
+                bboxes_preds_per_image = bbox_preds[batch_idx]  # [total_anchors, 4] - 현재 이미지의 bbox 예측
 
+                # OTA 동적 라벨 할당 수행 (메모리 부족시 CPU 모드로 fallback)
                 try:
+                    # GPU에서 OTA 할당 시도
                     (
-                        gt_matched_classes,
-                        fg_mask,
-                        pred_ious_this_matching,
-                        matched_gt_inds,
-                        num_fg_img,
-                    ) = self.get_assignments(  # noqa
+                        gt_matched_classes,      # [num_fg] - 매칭된 GT 클래스들
+                        fg_mask,                 # [total_anchors] - foreground 마스크
+                        pred_ious_this_matching, # [num_fg] - 매칭된 예측의 IoU 점수
+                        matched_gt_inds,         # [num_fg] - 매칭된 GT 인덱스들
+                        num_fg_img,              # 현재 이미지의 foreground 앵커 수
+                    ) = self.get_assignments(  # OTA 알고리즘 호출
                         batch_idx,
                         num_gt,
                         total_num_anchors,
@@ -1862,19 +1969,20 @@ class YOLOVHead(nn.Module):
                         imgs,
                     )
                 except RuntimeError:
+                    # 메모리 부족으로 실패시 경고 메시지 출력 후 CPU 모드로 재시도
                     logger.error(
                         "OOM RuntimeError is raised due to the huge memory cost during label assignment. \
                            CPU mode is applied in this batch. If you want to avoid this issue, \
                            try to reduce the batch size or image size."
                     )
-                    torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()  # GPU 메모리 정리
                     (
                         gt_matched_classes,
                         fg_mask,
                         pred_ious_this_matching,
                         matched_gt_inds,
                         num_fg_img,
-                    ) = self.get_assignments(  # noqa
+                    ) = self.get_assignments(  # CPU 모드로 OTA 재실행
                         batch_idx,
                         num_gt,
                         total_num_anchors,
@@ -1889,29 +1997,37 @@ class YOLOVHead(nn.Module):
                         obj_preds,
                         labels,
                         imgs,
-                        "cpu",
+                        "cpu",  # CPU 모드 지정
                     )
 
-                torch.cuda.empty_cache()
-                num_fg += num_fg_img
+                torch.cuda.empty_cache()  # 메모리 정리
+                num_fg += num_fg_img  # 전체 foreground 앵커 수에 누적
 
-                fg_idx = torch.where(fg_mask)[0]
+                # === STEP 6: 학습 타겟 생성 ===
+                fg_idx = torch.where(fg_mask)[0]  # foreground 앵커들의 인덱스 추출
 
+                # IoU 가중 분류 타겟 생성: one-hot 벡터에 IoU 점수를 곱해서 soft target 생성
                 cls_target = F.one_hot(
                     gt_matched_classes.to(torch.int64), self.num_classes
-                ) * pred_ious_this_matching.unsqueeze(-1)
-                obj_target = fg_mask.unsqueeze(-1)
-                reg_target = gt_bboxes_per_image[matched_gt_inds]
+                ) * pred_ious_this_matching.unsqueeze(-1)  # [num_fg, num_classes]
+                
+                # Objectness 타겟: foreground 마스크 그대로 사용
+                obj_target = fg_mask.unsqueeze(-1)  # [total_anchors, 1]
+                
+                # 회귀 타겟: 매칭된 GT bbox들 사용
+                reg_target = gt_bboxes_per_image[matched_gt_inds]  # [num_fg, 4]
 
+                # L1 손실 사용시: 정규화된 L1 타겟 생성
                 if self.use_l1:
                     l1_target = self.get_l1_target(
-                        outputs.new_zeros((num_fg_img, 4)),
-                        gt_bboxes_per_image[matched_gt_inds],
-                        expanded_strides[0][fg_mask],
-                        x_shifts=x_shifts[0][fg_mask],
-                        y_shifts=y_shifts[0][fg_mask],
+                        outputs.new_zeros((num_fg_img, 4)),  # 초기값 (사용 안됨)
+                        gt_bboxes_per_image[matched_gt_inds],  # 매칭된 GT bbox
+                        expanded_strides[0][fg_mask],  # foreground 앵커들의 stride
+                        x_shifts=x_shifts[0][fg_mask],  # foreground 앵커들의 X 좌표
+                        y_shifts=y_shifts[0][fg_mask],  # foreground 앵커들의 Y 좌표
                     )
 
+            # === STEP 7: 현재 배치 결과를 리스트에 저장 ===
             cls_targets.append(cls_target)
             reg_targets.append(reg_target)
             obj_targets.append(obj_target.to(dtype))
@@ -1920,6 +2036,8 @@ class YOLOVHead(nn.Module):
                 l1_targets.append(l1_target)
             fg_ids.append(fg_idx)
 
+        # === STEP 8: 최종 정규화 및 반환 ===
+        # 분모가 0이 되는 것을 방지하기 위해 최소값 1로 설정
         num_fg = max(num_fg, 1)
 
         return fg_ids,cls_targets,reg_targets,obj_targets,fg_masks,num_fg,num_gts,l1_targets
