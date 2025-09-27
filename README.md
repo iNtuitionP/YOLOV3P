@@ -324,6 +324,7 @@ YOLOV3P introduces three key improvements over YOLOV++ for more efficient and ef
 ## TODO
 - [ ] Analyze existing YOLOV++ codebase to understand current architecture and implementation details
 - [ ] Identify computational bottlenecks in YOLOV++ through profiling and performance analysis to Analyze efficiency of existing early exit mechanisms in related work for reference
+- [ ] Verify accuracy of model evaluation metrics on existing datasets
 - [ ] Implement reference score-based frame selection mechanism
 - [ ] Develop task-specific reference frame processing for REG and VOD CLS
 - [ ] Add early exit branch to Feature Aggregation Module (FAM)
