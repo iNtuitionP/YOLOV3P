@@ -275,25 +275,25 @@ YOLOV3P introduces three key improvements over YOLOV++ for more efficient and ef
 
 ### 🎯 Key Innovations
 
-1. **Reference Score-based Frame Selection**
-   - Replaces random reference frame selection with a learnable "reference score" mechanism
-   - Intelligently selects the most informative reference frames for feature aggregation
-   - Improves detection accuracy by focusing on high-quality temporal information
-
-2. **Task-specific Reference Frame Processing**
+1. **Task-specific Reference Frame Processing**
    - Separates reference frame processing for regression (REG) and video object detection classification (VOD CLS) tasks
    - Extracts specialized features for each task, improving computational efficiency
    - Reduces redundant computation while maintaining or improving performance
 
-3. **Early Exit Branch for FAM (Feature Aggregation Module)**
+2. **Early Exit Branch for FAM (Feature Aggregation Module)**
    - Introduces an early exit mechanism in the Feature Aggregation Module
    - Queries that don't require reference frame information bypass FAM and go directly to detection heads
    - Significantly reduces computational overhead for tokens that can be processed independently
 
+3. **Knowledge Distillation in YOLOV++ Head**
+   - Employs distillation between early-exit tokens and full-aggregation tokens within the YOLOV++ head
+   - Creates a more robust detection head by leveraging knowledge from both lightweight and comprehensive processing paths
+   - Enhances model performance while maintaining computational efficiency through internal knowledge transfer
+
 ### 🚀 Benefits
-- **Improved Accuracy**: Intelligent reference frame selection enhances temporal feature quality
+- **Improved Accuracy**: Knowledge distillation enhances detection performance through internal learning
 - **Enhanced Efficiency**: Task-specific processing and early exit mechanism reduce computational overhead
-- **Better Resource Utilization**: Adaptive processing based on query requirements
+- **Better Resource Utilization**: Adaptive processing based on query requirements and intelligent knowledge transfer
 
 // ... existing code (YOLOX Pretrain Models section) ...
 
@@ -323,11 +323,11 @@ YOLOV3P introduces three key improvements over YOLOV++ for more efficient and ef
 
 ## TODO
 - [ ] Analyze existing YOLOV++ codebase to understand current architecture and implementation details
-- [ ] Identify computational bottlenecks in YOLOV++ through profiling and performance analysis to Analyze efficiency of existing early exit mechanisms in related work for reference
 - [ ] Verify accuracy of model evaluation metrics on existing datasets
-- [ ] Implement reference score-based frame selection mechanism
+- [ ] Identify computational bottlenecks in YOLOV++ through profiling and performance analysis to Analyze efficiency of existing early exit mechanisms in related work for reference
 - [ ] Develop task-specific reference frame processing for REG and VOD CLS
 - [ ] Add early exit branch to Feature Aggregation Module (FAM)
+- [ ] Implement knowledge distillation between early-exit and full-aggregation tokens in YOLOV++ head
 - [ ] Conduct comprehensive experiments and release results
 - [ ] Release YOLOV3P code, models and training logs
 
